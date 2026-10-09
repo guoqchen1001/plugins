@@ -1,0 +1,75 @@
+{
+  "platform": "macOS",
+  "revision": "75c32d0",
+  "realAccount": true,
+  "steps": [
+    {
+      "step": "Keychain app sign-in",
+      "ok": true,
+      "anonymous": false
+    },
+    {
+      "step": "models",
+      "ok": true,
+      "count": 125
+    },
+    {
+      "step": "usage before",
+      "ok": true,
+      "windows": [
+        {
+          "name": "Requests",
+          "used": 94.13333333333334,
+          "display": "1412/1500 requests",
+          "resetsAt": "2026-10-14T03:06:44Z"
+        }
+      ]
+    },
+    {
+      "step": "non-stream chat",
+      "ok": true,
+      "status": 200,
+      "model": "auto-efficient",
+      "finishReason": "stop",
+      "usagePresent": false,
+      "elapsedMs": 4188
+    },
+    {
+      "step": "stream/tool plus prior-turn recall",
+      "ok": true,
+      "status": 200,
+      "model": "auto-efficient",
+      "toolCalls": [
+        {
+          "index": 0,
+          "name": "warp_verify"
+        }
+      ],
+      "finishReason": "tool_calls",
+      "usagePresent": false,
+      "done": true,
+      "elapsedMs": 7842
+    },
+    {
+      "step": "tool-result and multi-turn recall",
+      "ok": true,
+      "status": 200,
+      "finishReason": "stop",
+      "usagePresent": false,
+      "elapsedMs": 5112
+    },
+    {
+      "step": "usage after",
+      "ok": true,
+      "windows": [
+        {
+          "name": "Requests",
+          "used": 94.33333333333333,
+          "display": "1415/1500 requests",
+          "resetsAt": "2026-10-14T03:06:44Z"
+        }
+      ]
+    }
+  ],
+  "allPassed": true
+}

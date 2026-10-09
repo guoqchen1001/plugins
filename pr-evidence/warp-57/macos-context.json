@@ -1,0 +1,25 @@
+{
+  "platform": "macOS",
+  "path": "actual magpie /v1/messages",
+  "steps": [
+    {
+      "stream": false,
+      "status": 200,
+      "inputTokens": 14017,
+      "outputTokens": 0,
+      "answerOK": true,
+      "stopped": true,
+      "ok": true
+    },
+    {
+      "stream": true,
+      "status": 200,
+      "inputTokens": 14015,
+      "outputTokens": 0,
+      "answerOK": true,
+      "stopped": true,
+      "ok": true
+    }
+  ],
+  "allPassed": true
+}
