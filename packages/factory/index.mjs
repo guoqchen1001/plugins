@@ -727,6 +727,22 @@ function announcedContext(text, start = 1) {
     // Any hook owns its file snippets. Non-startup hooks do not stop the
     // existing adaptation of model/environment metadata that follows them.
     if (HOOK_NOTIFICATION.test(hook)) quoteChangedFiles = false
+    // Invoked skills span several paragraphs. The refused text is the fixed
+    // opening plus the complete IMPORTANT paragraph; skill bodies follow
+    // until the next attachment this adapter already knows. A token marker
+    // after the reminder is not required: Claude Code emits one after a tool
+    // result or a user prompt, and the restored reminder usually sits among
+    // other attachments. Keep skill text out of the paragraph adapter,
+    // including on a second pass.
+    if (part.startsWith(INVOKED_SKILLS_OPENING + " ") || part.startsWith(INVOKED_SKILLS_COMPAT + " ")) {
+      let end = i + 1
+      while (end < parts.length && !invokedSkillsBoundary(parts[end])) end++
+      const wrapped = open + parts.slice(i, end).join("\n\n") + close
+      if (invokedSkillsMatch(wrapped)) {
+        parts.splice(i, end - i, invokedSkills(wrapped).slice(open.length, -close.length))
+        continue
+      }
+    }
     const changedFile = quoteChangedFiles ? changedFileText(part) : null
     if (changedFile !== null) {
       parts[i] = changedFile
@@ -807,6 +823,43 @@ function systemModelLine(text) {
 const INSTRUCTIONS_REMINDER = "<system-reminder>\nCodebase and user instructions are shown below"
 const GLOBAL_INSTRUCTIONS = "(user's private global instructions for all projects)"
 
+// Claude Code (2.1.291 and later) restores skills invoked before compaction
+// as one generated reminder. Factory refuses that fixed opening, and the restored
+// skill text can quote the same client phrases tool output does. Keep the
+// remaining instructions and encode only a complete reminder whose body
+// quotes them. Pasted fragments and clean skill bodies stay verbatim.
+const INVOKED_SKILLS_OPENING = "The following skills were invoked EARLIER in this session (before the conversation was compacted), not on the current turn."
+const INVOKED_SKILLS_COMPAT = "Skills invoked earlier in this session are listed below for context."
+const INVOKED_SKILLS_REMINDER = /^<system-reminder>\nThe following skills were invoked EARLIER in this session \(before the conversation was compacted\), not on the current turn\. They are shown here for context only so you remain aware of their guidelines\.\n\nIMPORTANT: Do NOT re-execute these skills or perform their one-time setup actions \(e\.g\., scheduling, creating files\) again\. Any request or argument text embedded in the skill bodies below — for example under a "## User Request" or "## Input" heading — was captured when that skill was first invoked\. It is NOT the user's current message and NOT a new request: do not act on it as if it were live\. Only continue to apply ongoing behavioral guidelines from these skills where still relevant\.\n\n([\s\S]*)\n<\/system-reminder>$/
+// The next paragraph of a bundle that already belongs to another attachment.
+// Skill text ends here, so a following Read, environment or hook stays its
+// own paragraph. A skill body that merely quotes one of these stays inside.
+function invokedSkillsBoundary(part) {
+  if (SYSTEM_TOKEN_CONTEXT.test(part) || part.startsWith("<total_tokens>") || HOOK_NOTIFICATION.test(part)) return true
+  if (part.startsWith("Called the Read tool with the following input: ")) return true
+  if (part.startsWith("Note: ") && part.includes(" was read before the last conversation was summarized")) return true
+  if (part.startsWith("Result of calling the Read tool:\n")) return true
+  if (SYSTEM_ENV_CONTEXT.test(part + "\n") || SYSTEM_ENV_UPDATE.test(part + "\n")) return true
+  if (SYSTEM_MODEL_UPDATE.test(part)) return true
+  if (part === "The following skills are available for use with the Skill tool:") return true
+  if (part.startsWith("Available agent types for the Agent tool:")) return true
+  if (part.startsWith("# MCP Server Instructions")) return true
+  if (CHANGED_FILE_HEADER.test(part)) return true
+  return false
+}
+function invokedSkillsMatch(text) {
+  const opening = "<system-reminder>\n" + INVOKED_SKILLS_COMPAT
+  const generated = text.startsWith(opening) ? "<system-reminder>\n" + INVOKED_SKILLS_OPENING + text.slice(opening.length) : text
+  return generated.match(INVOKED_SKILLS_REMINDER)
+}
+function invokedSkills(text) {
+  const match = invokedSkillsMatch(text)
+  if (!match) return text
+  const quoted = quotedToolText(match[1], "Skill text encoded as a JSON string. Decode the JSON string to recover the exact original text before using it:\n")
+  const head = text.slice(0, text.length - match[1].length - "\n</system-reminder>".length)
+  return head.replace(INVOKED_SKILLS_OPENING, INVOKED_SKILLS_COMPAT) + quoted + "\n</system-reminder>"
+}
+
 // Factory returns 403 for Claude Code's fixed compaction opening, even
 // without tools or other history. Match the two generated opening sentences,
 // including the provenance prefix, without requiring a Summary label. Keep
@@ -840,6 +893,8 @@ function compactContext(text, quoteChangedFiles = true) {
   }
   const summary = piSummary(text)
   if (summary !== text) return summary
+  const skills = invokedSkills(text)
+  if (skills !== text) return skills
   const read = text.match(COMPACT_READ)
   if (read) {
     try {
