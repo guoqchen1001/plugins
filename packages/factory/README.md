@@ -157,12 +157,15 @@ the complete skill-header and bullet-list paragraphs inside a token-terminated
 bundle. It preserves MCP connection errors, other notifications, mode updates
 and custom skill descriptions while adapting the known built-in description.
 After `/compact`, Claude Code also sends the files it restores and the
-runtime context as one turn that opens with an unwrapped restored-file note
-or Read call, with no token marker first. When that turn also carries the
-generated environment paragraph or a token marker before any hook output,
-each fixed paragraph (file notes, Read calls and results, environment, model
-line) is adapted as in a token-prefixed bundle; everything else stays
-byte-for-byte. Quoted, incomplete and hook-owned forms are left alone.
+runtime context as one turn that opens with an unwrapped restored-file note,
+Read call or complete invoked-skills reminder, with no token marker first.
+A complete skills reminder is recognized even when no files were restored
+and no environment or token paragraph follows it. A restored-file opening
+requires the generated environment paragraph, a token marker or a complete
+skills reminder before any hook output. Each fixed paragraph (file notes,
+Read calls and results, skills, environment, model line) is adapted as in a
+token-prefixed bundle; everything else stays byte-for-byte. Quoted,
+incomplete and hook-owned forms are left alone.
 
 Factory can also refuse fixed client phrases quoted in tool results, such as
 the identity/environment definitions printed when inspecting this plugin's

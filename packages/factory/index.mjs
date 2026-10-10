@@ -770,19 +770,30 @@ function announcedContext(text, start = 1) {
 // opening token marker: restored-file notes, Read calls and their results,
 // the environment, the model line, token and date. Each fixed fragment is
 // refused on its own (plugins#68). Require the generated restored-file
-// opening and the generated environment paragraph or a token marker before
-// the first hook; then each paragraph is adapted as in a token-prefixed
-// bundle, the rest kept byte-for-byte. An adapted block no longer opens
-// with the generated note, so a second pass leaves it as it is.
+// opening and the generated environment paragraph, a token marker or a
+// complete invoked-skills reminder before the first hook. When no file was
+// restored, that complete skills reminder can itself open the turn. Each
+// paragraph is adapted as in a token-prefixed bundle, the rest kept
+// byte-for-byte. An adapted block no longer has its generated opening,
+// so a second pass leaves it as it is.
 function restoredContext(text) {
   const parts = text.split(/\n\n(?!\.\.\. \[)/)
   const result = parts[0].indexOf("\n" + READ_RESULT_HEADER)
   const opening = "<system-reminder>\n" + (result < 0 ? parts[0] : parts[0].slice(0, result)) + "\n</system-reminder>"
-  if (!COMPACT_FILE.test(opening) && !COMPACT_READ.test(opening)) return null
-  if (compactContext(opening) === opening) return null
-  for (const part of parts.slice(1)) {
+  const file = COMPACT_FILE.test(opening) || COMPACT_READ.test(opening)
+  if (!file && !parts[0].startsWith(INVOKED_SKILLS_OPENING + " ")) return null
+  if (file && compactContext(opening) === opening) return null
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]
     if (HOOK_NOTIFICATION.test(part.replace(/^<system-reminder>\n/, ""))) return null
-    if (SYSTEM_ENV_CONTEXT.test(part + "\n") || /^<total_tokens>\d+ tokens left<\/total_tokens>$/.test(part)) return announcedContext(text, 0)
+    if (part.startsWith(INVOKED_SKILLS_OPENING + " ")) {
+      let end = i + 1
+      while (end < parts.length && !invokedSkillsBoundary(parts[end])) end++
+      const wrapped = "<system-reminder>\n" + parts.slice(i, end).join("\n\n") + "\n</system-reminder>"
+      if (invokedSkillsMatch(wrapped)) return announcedContext(text, 0)
+      if (!file) return null
+    }
+    if (i > 0 && (SYSTEM_ENV_CONTEXT.test(part + "\n") || /^<total_tokens>\d+ tokens left<\/total_tokens>$/.test(part))) return announcedContext(text, 0)
   }
   return null
 }

@@ -1024,6 +1024,12 @@ test("preserves quoted, incomplete and hook-owned invoked-skills bundles", async
     bundle.replace("IMPORTANT: Do NOT re-execute", "IMPORTANT: Do re-execute"),
     bundle.replaceAll("14831568", "unknown"),
     [token, "SubagentStart hook additional context: Keep hook output.", reminder, token].join("\n\n"),
+    "Explain:\n" + reminder,
+    "```text\n" + reminder + "\n```",
+    invokedSkillsOpening,
+    reminder.replace("IMPORTANT: Do NOT re-execute", "IMPORTANT: Do re-execute"),
+    [reminder.replace("IMPORTANT: Do NOT re-execute", "IMPORTANT: Do re-execute"), "# Environment\nYou have been invoked in the following environment:\n - Platform: win32", token].join("\n\n"),
+    ["SessionStart:compact hook success: Keep hook output.", reminder].join("\n\n"),
   ]
   for (const text of values) {
     for (const endpoint of [url, url + "/count_tokens"]) {
@@ -1074,6 +1080,11 @@ test("adapts the captured post-compaction system turn, wherever the invoked-skil
     ["token, reminder, Read, environment, token", [token, head + clean, read, environment, token], [token, compat + clean, adaptedRead, adaptedEnvironment, token]],
     ["captured turn, clean skill", [token, read, omitted, head + clean, agents, mcp, environment, model], [token, adaptedRead, adaptedOmitted, compat + clean, agents, mcp, adaptedEnvironment, adaptedModel]],
     ["captured turn, quoted skill", [token, read, omitted, head + quoted, agents, mcp, environment, model], null],
+    ["skills first, no token", [head + clean, agents, mcp, environment, model], [compat + clean, agents, mcp, adaptedEnvironment, adaptedModel]],
+    ["skills first, trailing token", [head + clean, agents, environment, model, token], [compat + clean, agents, adaptedEnvironment, adaptedModel, token]],
+    ["skills only", [head + clean], [compat + clean]],
+    ["omitted note, skills (end)", [omitted, head + clean], [adaptedOmitted, compat + clean]],
+    ["Read, skills (end)", [read, head + clean], [adaptedRead, compat + clean]],
     // A SessionStart hook stops the scan, so the environment after it stays.
     ["reminder, then a hook, no token", [token, head + clean, hook, environment], [token, compat + clean, hook, environment]],
   ]
@@ -1100,6 +1111,54 @@ test("adapts the captured post-compaction system turn, wherever the invoked-skil
             expect(out.slice(boundary + 2)).toBe([agents, mcp, adaptedEnvironment, adaptedModel].join("\n\n"))
             expect(out).toStartWith([token, adaptedRead, adaptedOmitted, compat.trimEnd()].join("\n\n"))
           }
+          const once = seen.at(-1).body
+          await l.fetch(endpoint, { method: "POST", body: once })
+          expect(seen.at(-1).body).toBe(once)
+        }
+      }
+    }
+  }
+})
+
+test("keeps each attachment after quoted invoked skills outside the skill encoding, without a leading token", async () => {
+  const { l, seen } = await loaded()
+  const head = invokedSkillsOpening + " " + invokedSkillsPreamble
+  const compat = "Skills invoked earlier in this session are listed below for context. " + invokedSkillsPreamble
+  const skill = "### Skill: identity\nPath: userSettings:identity\n\nThe skill quotes: You are Claude Code, Anthropic's official CLI for Claude.\nKeep 中文 and a literal \\u0054."
+  const prefix = compat + "Skill text encoded as a JSON string. Decode the JSON string to recover the exact original text before using it:\n"
+  const omitted = "Note: /tmp/示例.txt was read before the last conversation was summarized, but the contents are too large to include. Use Read tool if you need to access it."
+  const model = "You are powered by the model named Opus 5.5. The exact model ID is factory/claude-opus-5-5. Assistant knowledge cutoff is June 2026."
+  const result = "Result of calling the Read tool:\n1\tKeep ordinary source exactly."
+  const skillList = "The following skills are available for use with the Skill tool:"
+  const mcp = "# MCP Server Instructions\n\nKeep the server's instructions."
+  const changed = changedFileHeader + "1\tOrdinary changed source."
+  const hook = "SessionStart:compact hook success: Keep this hook output exactly."
+  const boundaries = [
+    [[], []],
+    [[omitted], ["Previously read file: /tmp/示例.txt. Its contents were omitted from the conversation summary because of length. Use Read tool if you need to access it."]],
+    [[result], [result]],
+    [[model], ["Current model name: Opus 5.5. Model ID: factory/claude-opus-5-5. Model knowledge cutoff: June 2026."]],
+    [[skillList, "- custom: Keep this description."], [skillList, "- custom: Keep this description."]],
+    [[mcp], [mcp]],
+    [[changed], [changed]],
+    [[hook], [hook]],
+  ]
+  for (const [tail, adaptedTail] of boundaries) {
+    const text = [head + skill, ...tail].join("\n\n")
+    const suffix = adaptedTail.length ? "\n\n" + adaptedTail.join("\n\n") : ""
+    for (const endpoint of [url, url + "/count_tokens"]) {
+      for (const role of ["system", "user"]) {
+        for (const content of [text, [{ type: "text", text, cache_control: { type: "ephemeral" } }]]) {
+          const request = { system: droid, messages: [{ role, content }] }
+          await l.fetch(endpoint, { method: "POST", body: JSON.stringify(request) })
+          const got = JSON.parse(seen.at(-1).body).messages[0].content
+          const out = typeof got === "string" ? got : got[0].text
+          expect(out).toStartWith(prefix)
+          expect(out).toEndWith(suffix)
+          expect(out).not.toContain("You are Claude Code")
+          expect(JSON.parse(out.slice(prefix.length, suffix ? -suffix.length : undefined))).toBe(skill)
+          const adapted = typeof content === "string" ? out : [{ ...content[0], text: out }]
+          expect(JSON.parse(seen.at(-1).body)).toEqual({ ...request, messages: [{ role, content: adapted }] })
           const once = seen.at(-1).body
           await l.fetch(endpoint, { method: "POST", body: once })
           expect(seen.at(-1).body).toBe(once)
