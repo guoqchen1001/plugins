@@ -807,7 +807,10 @@ export const GrokAuthPlugin = async ({ client }) => {
             id: m.id,
             providerID: provider.id,
             name: m.name,
-            api: { ...(was.api ?? {}), id: m.apiId, url: BASE, npm: "@ai-sdk/openai" },
+            // the id as offered, window and all: magpie and the AI SDK send
+            // api.id as the body's model, and fetch reads the window from it
+            // (modelOf) before Grok sees the plain model
+            api: { ...(was.api ?? {}), id: m.id, url: BASE, npm: "@ai-sdk/openai" },
             limit: { ...(was.limit ?? {}), context: m.context || was.limit?.context || 0, output: was.limit?.output ?? 0 },
             capabilities: {
               ...(was.capabilities ?? {}),
