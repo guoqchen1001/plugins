@@ -152,6 +152,10 @@ Standalone skill updates can instead start with the generated skill-list
 header and end with a token marker, for example when leaving auto mode.
 That complete form receives the same adaptation while retaining the skill
 descriptions and mode-change instructions.
+The skill list can also come alone as a `system` message, with only its
+entries: no header, no reminder wrapper and no token marker, as text blocks
+or a string. A `system` message that opens with an entry gets the same
+change to the known `update-config` line; everything else in it stays.
 When runtime notifications precede the skill update, the adapter recognizes
 the complete skill-header and bullet-list paragraphs inside a token-terminated
 bundle. It preserves MCP connection errors, other notifications, mode updates
@@ -193,7 +197,11 @@ Use magpie's Claude Code integration to select the Factory provider.
 magpie manages the provider-specific client settings, including capability
 and permission configuration. Fields such as `safeguards` and
 `context_management` are forwarded for Factory to validate; the request
-adapter preserves them along with the other request options.
+adapter preserves them along with the other request options. One exception:
+Factory's streaming route refuses `context_management` ("Extra inputs are
+not permitted") while its non-streaming route takes it, so a streamed
+request is sent without it. The server then clears nothing from the
+context; Claude Code's own compaction still runs.
 
 The same metadata adaptation applies to `/messages` and
 `/messages/count_tokens`, so token counting sees the prompt used for

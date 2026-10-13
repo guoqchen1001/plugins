@@ -7,7 +7,7 @@
 // and cloud-models feeds; usage reads the account's credit balance and, on
 // ClinePass, the plan's 5-hour, weekly and monthly limits.
 import { STATUS_CODES } from "node:http"
-import { randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 
 const PROVIDER = "cline"
 const API = "https://api.cline.bot/api/v1"
@@ -37,9 +37,29 @@ const DEVICE_CAP = 600 // seconds the browser may take, however long the code li
 // only thing that has to match).
 const CLIENT = { type: "cline-cli", version: "3.0.68", platform: "cli", core: "0.0.90" }
 
+// Pass the host's session through the chat.headers hook to the loader's
+// fetch. This private header never leaves the plugin.
+const SESSION = "x-magpie-cline-session"
+
+// magpie's synthetic session from the first user message doesn't identify a
+// task: unrelated conversations can start with that same message.
+function sessionOf(input) {
+	const s = String(input?.sessionID ?? "").trim()
+	if (!s || /^magpie-[0-9a-f]{24}$/.test(s)) return ""
+	return s.slice(0, 128)
+}
+
+function taskIdOf(session) {
+	const bytes = createHash("sha256").update("cline task\0").update(session).digest().subarray(0, 16)
+	const b = Buffer.from(bytes)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	const h = b.toString("hex")
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
 // clientHeaders is the header set resolveProviderRequestHeaders builds for a
-// client with that identity; a task id rides per chat request, as the
-// official clients ride one per task
+// client with that identity; official clients supply a task id per task.
 function clientHeaders(taskId) {
 	return {
 		"HTTP-Referer": "https://cline.bot",
@@ -175,7 +195,7 @@ async function clineApi(url, { method = "GET", body, headers = {}, signal, lapse
 	const text = (await res.text().catch(() => "")).trim()
 	if (gone(res.status, text))
 		throw new Lapsed(`the sign-in lapsed — Cline refused it (HTTP ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}); sign in to Cline again`)
-	if (!res.ok) throw new Error(`Cline request failed (HTTP ${res.status}${text ? `: ${text.slice(0, 200)}` : ""})`)
+	if (!res.ok) throw Object.assign(new Error(`Cline request failed (HTTP ${res.status}${text ? `: ${text.slice(0, 200)}` : ""})`), { status: res.status })
 	const env = safeJson(text)
 	if (env && typeof env === "object" && "success" in env) {
 		if (!env.success) throw new Error(`Cline request failed${env.error ? `: ${env.error}` : ""}`)
@@ -840,17 +860,31 @@ export const ClinePlugin = async ({ client } = {}, options = {}) => {
 
 	// usage is the account's credit balance and its ClinePass limits,
 	// magpie's own hook. A read the account's token couldn't make is the
-	// sign-in, not the read; the limits are asked alongside and an account
-	// without ClinePass (or one they can't be read for) just has none.
+	// sign-in, not the read. The limits are asked alongside: a 404 there is
+	// an account without ClinePass, which has its credits alone (AxonHub's
+	// Cline checker reads it the same way); any other failure says so on the
+	// card rather than leaving the limits off unsaid (#79). Whichever of the
+	// two reads succeeds is shown when the other fails: windows read are
+	// kept when the balance can't be, as magpie's built-in key card keeps
+	// them.
 	const usage = async (getAuth) => {
 		try {
 			const cred = await fresh(getAuth)
 			const authz = { Authorization: `Bearer ${cred.bearer}` }
-			const me = await clineApi(`${API}/users/me`, { headers: authz })
-			const limits = clineApi(`${API}/users/me/plan/usage-limits`, { headers: authz, lapsed: () => false }).catch(() => null)
+			const limits = clineApi(`${API}/users/me/plan/usage-limits`, { headers: authz, lapsed: () => false }).then(
+				(v) => ({ v }),
+				(e) => (e?.status === 404 ? { v: null } : { e }),
+			)
+			let me = null
+			let lastErr = null
+			try {
+				me = await clineApi(`${API}/users/me`, { headers: authz })
+			} catch (e) {
+				if (e?.expired) throw e
+				lastErr = e
+			}
 			const ids = [me?.clineUserId, me?.subject, me?.id, cred.uid].filter((v) => typeof v === "string" && v.trim())
 			let balance = null
-			let lastErr = null
 			for (const id of ids) {
 				try {
 					balance = await clineApi(`${API}/users/${encodeURIComponent(id)}/balance`, { headers: authz })
@@ -859,14 +893,26 @@ export const ClinePlugin = async ({ client } = {}, options = {}) => {
 					lastErr = e
 				}
 			}
-			if (!balance) throw lastErr ?? new Error("Cline usage: no user id")
-			return { ...usageOf(me, balance, await limits), user: firstOf(cred.accountId, cred.email, cred.uid, ids[0]), signIn: renewed(cred) ? "renewed" : "kept" }
+			const lim = await limits
+			const out = usageOf(me, balance, lim.v)
+			if (!balance && !out.windows.length) throw lastErr ?? lim.e ?? new Error("Cline usage: no user id")
+			if (lim.e) {
+				// the words magpie's card knows (quotaError), the reason after
+				const why = String(lim.e?.message ?? lim.e).replace(/^Cline(?: request failed)?:?\s*/, "")
+				out.error = "ClinePass limits couldn't be read" + (why.startsWith("(") ? " " : ": ") + why
+			}
+			return { ...out, user: firstOf(cred.accountId, cred.email, cred.uid, ids[0]), signIn: renewed(cred) ? "renewed" : "kept" }
 		} catch (e) {
 			return { windows: [], error: e?.message ?? String(e), signIn: e?.expired ? "expired" : "kept" }
 		}
 	}
 
 	return {
+		async "chat.headers"(input, output) {
+			if (input?.model?.providerID !== PROVIDER && input?.provider?.info?.id !== PROVIDER) return
+			const session = sessionOf(input)
+			if (session) output.headers[SESSION] = session
+		},
 		config: async (cfg) => {
 			cfg.provider ??= {}
 			const was = cfg.provider[PROVIDER] ?? {}
@@ -945,10 +991,11 @@ export const ClinePlugin = async ({ client } = {}, options = {}) => {
 							return signedInError(e)
 						}
 						const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+						const session = headers.get(SESSION)
+						headers.delete(SESSION)
+						headers.delete("X-Task-ID")
 						headers.set("Authorization", `Bearer ${cred.bearer}`)
-						// the request says who it comes from, headers down, exactly as
-						// Cline's own client does — and rides its own task id
-						for (const [k, v] of Object.entries(clientHeaders(randomUUID()))) headers.set(k, v)
+						for (const [k, v] of Object.entries(clientHeaders(session ? taskIdOf(session) : undefined))) headers.set(k, v)
 						headers.delete("content-length")
 						headers.delete("host")
 						let res

@@ -22,13 +22,20 @@ irm https://x.ai/cli/install.ps1 | iex                 # Windows
     `~/.config`). Grok Build's own sign-in stays as it is.
 - **Use Grok Build's current sign-in** takes the account the CLI is
   signed in to, with nothing to approve.
+- **Import CPA Grok account JSON** copies one enabled xAI OAuth account from
+  a CLIProxyAPI (CPA) account JSON file (CPA keeps it as
+  `~/.cli-proxy-api/xai-<email>.json`) into a private home for this plugin.
+  CPA and Grok Build rotate the same refresh token, so stop using that
+  account in CPA before importing it. The file is read, never rewritten.
 
 ## Where the sign-in is kept
 
 The CLI keeps the sign-in in its home, as `auth.json`. OpenCode (or
-magpie) keeps where that home is, the token and its expiry.
+magpie) keeps where that home is, the token and its expiry. Importing a CPA
+account writes only its translated xAI OAuth fields to a private home owned
+by this plugin; the selected CPA file is left unchanged.
 
-The plugin only reads `auth.json`: the CLI's refresh gives a new token
+The plugin reads `auth.json`; Grok Build refreshes the token, which changes
 each time. The plugin runs `grok models` in that home, so the CLI renews
 it, then reads it again:
 
@@ -55,7 +62,11 @@ API (`@ai-sdk/openai`), signed as the CLI signs them:
 - `x-grok-client-mode: headless`
 - `x-grok-client-version` and `User-Agent: grok-shell/<version> (<os>; <arch>)`.
   The version is 1.0.41, or the installed CLI's if it is newer.
-- `x-grok-model-override`: the request's model.
+- `x-grok-model-override`: the request's model. A window suffix
+  (`grok-4.7@500k`) is the plain model (`grok-4.7`) here and in the body.
+- `x-grok-context-window`: the token count a suffixed model names
+  (`500000` for `@500k`). The plain id sends no such header and stays on
+  the default window.
 - `x-grok-conv-id`: the request's `prompt_cache_key`.
 
 The backend turns away some of what a request may carry, so the plugin
@@ -73,8 +84,17 @@ unrecognized content stays unchanged; the plugin does not decrypt tasks.
 ## Models
 
 Grok 4.7 until signed in. Signed in, the models are the ones the account
-lists at `/v1/models` (Responses models only), each with its context
-window and its reasoning efforts as variants.
+lists at `/v1/models` (Responses models only), each with its reasoning
+efforts as variants.
+
+`context_window` is the default window and keeps the plain id, so a saved
+`grok-4.7` stays a 256k model. Each other size in `context_windows` is
+offered beside it, named `Grok 4.7 @ 500k` with id `grok-4.7@500k` and
+that many tokens as its window. A request for it sends
+`x-grok-context-window: 500000`. The proxy serves up to its largest
+window either way and refuses past it; the header names the window the
+caller asked to compact against. Pick `grok-4.7@500k` where a client
+compacts at the advertised window, such as Claude Code.
 
 ## Usage
 
@@ -87,3 +107,7 @@ read 0% used while its requests come back 429. After a 429 the card shows
 a spent "Rate limit" window until the reset it named (`Retry-After`, or a
 `*ratelimit*reset*` header). When it named none, the window stays until a
 request goes through, or for 5 minutes.
+
+Grok Bot's separate allowance is shown by the [Cursor plugin](../cursor/README.md#usage).
+Sign in there with the Cursor account linked in Grok Bot, including for
+access through SuperGrok.

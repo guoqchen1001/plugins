@@ -340,9 +340,11 @@ async function refreshJob(site, refresh, user) {
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const EFF5 = ["low", "medium", "high", "xhigh", "max"]
 
-// Qoder's list when the account's can't be asked (as it was on 2026-09-30).
+// Qoder's list when the account's can't be asked (as it was on 2026-09-30,
+// with the app's Fast from 2026-10-12).
 const MODELS = [
   { id: "ultimate", name: "Ultimate", context: 1_000_000, efforts: EFF5 },
+  { id: "fast", name: "Fast", context: 1_000_000 },
   { id: "performance", name: "Performance", context: 1_000_000, efforts: EFF5 },
   { id: "efficient", name: "Efficient", context: 200_000 },
   { id: "smodel", name: "Sonus", context: 180_000, efforts: EFF5 },
@@ -485,10 +487,34 @@ function modelInfo(raw) {
   return m
 }
 
-// modelInfos is the listing's enabled chat models an agent can pick: "auto"
+// sceneModels is the models an agent can pick from the listing: the "app"
+// scene's, which is what Qoder's app shows and what a request names
+// (qoderBody's product and session_type "app"), in its order, then any
+// "chat" model the app no longer lists, after the model it followed there,
+// so a pick made before stays served. On 2026-10-12 the app listed Fast
+// (fast, 0.8×) where Performance (1.1×) had been, and chat still listed
+// Performance (magpie-community/plugins#97). A listing with only one scene
+// gives that one. Each key once: the app's entry wins.
+function sceneModels(listing) {
+  const app = Array.isArray(listing?.app) ? listing.app : []
+  const chat = Array.isArray(listing?.chat) ? listing.chat : []
+  const out = [...app]
+  let after = -1
+  for (const m of chat) {
+    const i = out.findIndex((x) => x?.key === m?.key)
+    if (i >= 0) {
+      after = i
+      continue
+    }
+    out.splice(++after, 0, m)
+  }
+  return out
+}
+
+// modelInfos is the listing's enabled models an agent can pick: "auto"
 // and "default" route inside Qoder and aren't one model.
 function modelInfos(listing) {
-  return (listing?.chat ?? [])
+  return sceneModels(listing)
     .filter((m) => m?.enable && !["", "auto", "default"].includes(String(m.key ?? "").trim()))
     .map(modelInfo)
 }
@@ -694,19 +720,55 @@ function qoderBody(chat, m) {
   return body
 }
 
-// failure is the status and message for a Qoder failure: a refused sign-in
-// asks for another, a quota is a 429.
+// failure is the status and message for a Qoder failure. Qoder's own code
+// says what it is, read as Qoder's client reads it (QoderErrorCode in the
+// app's qoder-agent-sdk worker): only 105 (loginExpired) is a lapsed
+// sign-in there, so a 401/403 that carries another code isn't one here
+// either (#98: a queued 10605 came as a 403 and read as "sign in again").
+// A refused chat with no code keeps the built-in's 401, and a quota is a
+// 429.
+const QUEUED = "10605"
+// the codes Qoder's client counts as a plan's usage or credits used up
+const QUOTA_CODES = new Set(["110", "112", "113", "114", "115", "116", "117", "118", "119", "122"])
+// refusals of this request, not of the account: sensitive content, not
+// supported, input too long, too many media, a custom model's service
+const REQUEST_CODES = new Set(["406", "416", "430", "80411", "80412", "100400", "100401", "100403"])
+const BUSY_WAIT = 30
+
 function failure(status, text) {
   if (status < 400 || status > 599) status = 502
   let msg = String(text ?? "").trim()
+  let code = ""
+  let queue
   try {
     const j = JSON.parse(text)
-    if (j?.message) msg = j.message
+    code = j?.code == null ? "" : String(j.code)
+    if (j?.message) msg = String(j.message)
     // details is a JSON string, or the object itself (gjson reads either)
     const d = typeof j?.details === "string" ? JSON.parse(j.details) : j?.details
     if (d?.error?.message) msg += ": " + d.error.message
+    // the queue's state: the message itself, as a JSON string, or a field
+    queue = j?.queue && typeof j.queue === "object" ? j.queue : undefined
+    if (!queue && typeof j?.message === "string" && j.message.trim().startsWith("{")) {
+      const q = JSON.parse(j.message)
+      if (q && typeof q === "object" && ("isQueued" in q || "serviceAvailable" in q || "retryAfterSeconds" in q)) queue = q
+    }
   } catch {}
   msg ||= STATUS_CODES[status] ?? `HTTP ${status}`
+  // Qoder's queue for the model: busy for now, with when to ask again. The
+  // sign-in is fine (the same token reads the models and the usage), so it
+  // is a 503 with Retry-After, which magpie asks again after, and never
+  // touches the account's sign-in.
+  if (code === QUEUED || queue?.isQueued === true || queue?.serviceAvailable === false) {
+    const n = Number(queue?.retryAfterSeconds)
+    const wait = Number.isFinite(n) && n > 0 ? Math.ceil(n) : BUSY_WAIT
+    const model = queue?.modelKey ? ` for ${queue.modelKey}` : ""
+    const tier = queue?.queueType ? ` (this plan's queue: ${queue.queueType})` : ""
+    const what = queue?.isQueued === true ? "queued the request" : "is busy"
+    return { status: 503, message: `Qoder ${what}${model}${tier}; try again in ${wait}s`, retryAfter: wait, signIn: "" }
+  }
+  if (QUOTA_CODES.has(code)) return { status: 429, message: "usage limit reached: " + msg, signIn: "" }
+  if (REQUEST_CODES.has(code)) return { status: 400, message: `Qoder refused the request (${code}): ${msg}`, signIn: "" }
   // a refused chat is the built-in's 401, which never marked the account
   // lapsed: only a refused refresh did (errorResponse says kept). Qoder's
   // own words go with it: a 401 right after signing in isn't a lapsed
@@ -721,11 +783,16 @@ function failure(status, text) {
 
 // errorResponse is a failure as OpenAI's API gives it. signIn is what it
 // means for the account (magpie's X-Magpie-Sign-In): a 401 keeps it unless
-// told expired, since the built-in marked only a refused refresh.
-const errorResponse = ({ status, message, signIn = status === 401 ? "kept" : undefined }) =>
+// told expired, since the built-in marked only a refused refresh. retryAfter
+// (seconds) is sent as Retry-After.
+const errorResponse = ({ status, message, signIn = status === 401 ? "kept" : undefined, retryAfter }) =>
   new Response(JSON.stringify({ error: { message, type: "qoder_error", code: status } }), {
     status,
-    headers: { "Content-Type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}),
+      ...(retryAfter > 0 ? { "Retry-After": String(retryAfter) } : {}),
+    },
   })
 
 // ---- the reply ----------------------------------------------------------------

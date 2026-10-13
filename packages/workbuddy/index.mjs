@@ -77,7 +77,25 @@ const SITES = {
     platform: "workbuddy-ai",
     ai: true,
     models: AI_MODELS,
+    // models whose images WorkBuddy AI drops though its config says they
+    // take them (see textOnly)
+    noImages: /^glm-/,
   },
+}
+
+// textOnly says whether site drops the images sent to model, whatever its
+// config says. On 2026-10-13, with a real WorkBuddy AI account (Yirasumi on
+// Discord), www.workbuddy.ai's /v3/config marked every model
+// supportsImages: true, but a chat to glm-5.3-flash, glm-5.3 or glm-5.2
+// came back saying "[System reminder: the current model does not support
+// images. Content filtered. ...]": the server had taken the image out.
+// Its other models (deepseek-v4.1-flash, kimi, gemini, grok, gpt) read
+// them, and WorkBuddy (China)'s glm-5.3-flash does too, so this is WorkBuddy
+// AI's GLM models alone. Said text-only, magpie's image-describing model
+// reads the image for them; a user who said the model takes images keeps
+// their own answer (magpie's settings, over what this list says).
+function textOnly(site, model) {
+  return !!site.noImages?.test(model)
 }
 
 const NPM = "@ai-sdk/openai-compatible"
@@ -172,6 +190,7 @@ function renew(site, a, save) {
         "X-Refresh-Token": a.refresh,
         "X-Auth-Refresh-Source": "plugin",
         "X-Domain": domainOf(site, a),
+        ...enterpriseHeaders(a),
       }, {})
       if (!got?.accessToken) throw Object.assign(new Error("WorkBuddy gave no refreshed token"), { bare: true })
       const next = merge(a, got)
@@ -259,8 +278,46 @@ function sign(site, a, headers) {
   headers.set("X-Agent-Purpose", "conversation")
   headers.set("X-IDE-Name", "WorkBuddy")
   headers.set("X-IDE-Version", UA_VERSION)
+  for (const [k, v] of Object.entries(enterpriseHeaders(a))) headers.set(k, v)
   if (!site.ai) return
   headers.set("X-Agent-Type", "main")
+}
+
+// enterpriseHeaders names the enterprise (team) an account signed in as, as
+// WorkBuddy's own client does on every request it makes for that account
+// (its auth interceptor: X-Enterprise-Id and X-Tenant-Id, both the
+// account's enterpriseId). Without them WorkBuddy answers as the personal
+// account: /v3/config lists the personal plan's models and not the
+// enterprise's (#75). A personal account has none and sends none.
+function enterpriseHeaders(a) {
+  const id = typeof a?.enterpriseId === "string" ? a.enterpriseId.trim() : ""
+  return id ? { "X-Enterprise-Id": id, "X-Tenant-Id": id } : {}
+}
+
+// enterpriseOf is the enterprise the account a sign-in gave belongs to:
+// the one /login/account names, else, for an account that isn't personal,
+// the one WorkBuddy's account list has for it — the same choice WorkBuddy's
+// own client makes (mergeCurrentAccountDetails): the uid's only entry of that
+// type, or the only one it last signed in to. None found is personal.
+async function enterpriseOf(site, a, who) {
+  const own = typeof who?.enterpriseId === "string" ? who.enterpriseId.trim() : ""
+  if (own) return own
+  const type = String(who?.type ?? "").trim().toLowerCase()
+  if (!type || type === "personal") return ""
+  let list
+  try {
+    list = await call(site, "GET", "/v2/plugin/accounts", {
+      Authorization: "Bearer " + a.access,
+      "X-Domain": domainOf(site, a),
+    })
+  } catch {
+    return ""
+  }
+  const mine = (list?.accounts ?? []).filter((x) => x?.uid === who.uid && typeof x.enterpriseId === "string" && x.enterpriseId.trim())
+  const same = mine.filter((x) => String(x.type ?? "").trim().toLowerCase() === type)
+  const last = mine.filter((x) => x.lastLogin)
+  const pick = same.length === 1 ? same[0] : last.length === 1 ? last[0] : mine.length === 1 ? mine[0] : undefined
+  return pick ? pick.enterpriseId.trim() : ""
 }
 
 // WorkBuddy's own client names each chat to its gateway four ways: the
@@ -448,8 +505,11 @@ function unflag(messages) {
 }
 
 // withSystem gives a chat that doesn't open with a system message
-// WorkBuddy's default one, as its app does, and takes FLAGGED's words out
-// of it.
+// WorkBuddy's default one, as its app does, takes FLAGGED's words out of it,
+// and applies the request spellings WorkBuddy's chat endpoint accepts. The
+// OpenAI-compatible client normally uses max_completion_tokens and may call a
+// reasoning prompt developer; WorkBuddy's endpoint takes max_tokens and
+// system instead.
 function withSystem(body) {
   // a body magpie or OpenCode hands over as bytes is read as the text it is
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) body = new TextDecoder().decode(body)
@@ -458,11 +518,64 @@ function withSystem(body) {
     const b = JSON.parse(body)
     if (!Array.isArray(b?.messages) || !b.messages.length) return body
     let changed = unflag(b.messages)
+    if (b.max_completion_tokens !== undefined) {
+      if (b.max_tokens === undefined) b.max_tokens = b.max_completion_tokens
+      delete b.max_completion_tokens
+      changed = true
+    }
+    for (const m of b.messages) {
+      if (m?.role !== "developer") continue
+      m.role = "system"
+      changed = true
+    }
     if (b.messages[0]?.role !== "system") {
       b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
       changed = true
     }
     return changed ? JSON.stringify(b) : body
+  } catch {
+    return body
+  }
+}
+
+// normalizeToolChoice converts the object form emitted by OpenAI clients to
+// WorkBuddy's string form. It runs after fitted(), so a named choice follows a
+// tool name that was made safe for WorkBuddy.
+function normalizeToolChoice(body) {
+  if (typeof body !== "string") return body
+  try {
+    const b = JSON.parse(body)
+    if (!b || typeof b !== "object" || Array.isArray(b) || !("tool_choice" in b)) return body
+    const choice = b.tool_choice
+    if (typeof choice === "string") {
+      if (choice.trim().toLowerCase() === "none") {
+        delete b.tool_choice
+        delete b.tools
+        delete b.functions
+      }
+      return JSON.stringify(b)
+    }
+    if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+      delete b.tool_choice
+      return JSON.stringify(b)
+    }
+    const type = typeof choice.type === "string" ? choice.type.trim().toLowerCase() : ""
+    if (type === "none") {
+      delete b.tool_choice
+      delete b.tools
+      delete b.functions
+    } else if (type === "auto" || type === "required") {
+      b.tool_choice = type
+    } else if (type === "function") {
+      const fn = choice.function && typeof choice.function === "object" && !Array.isArray(choice.function)
+        ? choice.function
+        : undefined
+      const name = typeof fn?.name === "string" ? fn.name.trim() : ""
+      b.tool_choice = name || "auto"
+    } else {
+      delete b.tool_choice
+    }
+    return JSON.stringify(b)
   } catch {
     return body
   }
@@ -759,6 +872,7 @@ async function browserSignIn(site) {
           "X-No-Enterprise-Id": "true",
         }, [12151], deadline)
         a.uid = who.uid ?? ""
+        a.enterpriseId = await enterpriseOf(site, a, who)
         return success(site, a, who.nickname || who.phoneNumber || who.uid)
       } catch (e) {
         return { type: "failed", error: e.message }
@@ -776,6 +890,7 @@ function success(site, a, name) {
     accountId: name || site.name,
     uid: a.uid ?? "",
     domain: a.domain ?? "",
+    ...(a.enterpriseId ? { enterpriseId: a.enterpriseId } : {}),
     ...(a.refreshExpiresAt ? { refreshExpiresAt: a.refreshExpiresAt } : {}),
     ...(a.tokenType ? { tokenType: a.tokenType } : {}),
   }
@@ -808,11 +923,25 @@ function readDesktop(site) {
       domain: typeof t.domain === "string" ? t.domain : "",
       tokenType: typeof t.tokenType === "string" ? t.tokenType : "",
       uid: acct.uid,
+      ...(typeof acct.enterpriseId === "string" && acct.enterpriseId.trim() ? { enterpriseId: acct.enterpriseId.trim() } : {}),
       name: acct.nickname || acct.phoneNumber || acct.uid,
     }
   } catch {
     return null
   }
+}
+
+// notDesktop says why there is no desktop sign-in to use: WorkBuddy 5.6
+// and later seal its tokens at rest ({$wbEncrypted: 1, envelope}), which
+// only the app itself opens (plugins#18), so the browser sign-in is the way;
+// else the app isn't signed in.
+function notDesktop(site) {
+  try {
+    const t = JSON.parse(readFileSync(desktopFile(site), "utf8"))?.auth ?? {}
+    if (t.accessToken?.$wbEncrypted || t.refreshToken?.$wbEncrypted)
+      return `${site.name} desktop keeps its sign-in encrypted (WorkBuddy 5.6 and later), which magpie can't read; sign in with "${site.name} account (browser)" instead`
+  } catch {}
+  return `${site.name} desktop isn't signed in`
 }
 
 // desktopSignIn uses the account WorkBuddy desktop is signed in to: nothing
@@ -826,7 +955,7 @@ function desktopSignIn(site) {
     method: "auto",
     async callback() {
       const d = readDesktop(site)
-      if (!d) return { type: "failed", error: `${site.name} desktop isn't signed in` }
+      if (!d) return { type: "failed", error: notDesktop(site) }
       return { type: "success", refresh: "", access: "", expires: 0, source: "desktop", accountId: d.name || site.name, uid: d.uid }
     },
   }
@@ -841,7 +970,7 @@ const desktopHeld = new Map()
 async function current(site, client, auth) {
   if (auth?.source !== "desktop") return fresh(site, client, auth)
   const d = readDesktop(site)
-  if (!d) throw new Error(`${site.name} desktop isn't signed in`)
+  if (!d) throw new Error(notDesktop(site))
   const k = site.id + "|" + d.uid
   const h = desktopHeld.get(k)
   const a = await fresh(site, null, h && h.expires >= d.expires ? h : d)
@@ -875,13 +1004,13 @@ const statusText = (n) => STATUS_TEXT[n] || `HTTP ${n}`
 
 // meter asks the billing API as magpie's built-in did, its errors said
 // the same: WorkBuddy's message, else its code, else the HTTP status.
-async function meter(site, a, path) {
+async function meter(site, a, path, body = {}) {
   const res = await fetch(site.endpoint + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + UA_VERSION,
       Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a), "X-Product": "SaaS",
-      "X-IDE-Type": "WorkBuddy" },
-    body: "{}",
+      "X-IDE-Type": "WorkBuddy", ...enterpriseHeaders(a) },
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(20000),
   })
   let env = {}
@@ -925,6 +1054,76 @@ function usageOf(sum, plan) {
   }
   if (total > 0) out.windows.push({ name: "Credits", used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
   return out
+}
+
+// The packages' codes, as WorkBuddy's own client lists them when it asks
+// for each package's credits (its COMMODITY_CODES): the API refuses a
+// detail list without them (10001 "PackageCodes required").
+const CODE = (n, s) => `TCACA_code_${n}_${s}`
+const PAID_CODES = [CODE("002", "AkiJS3ZHF5"), CODE("005", "maRGyrHhw1"), CODE("003", "FAnt7lcmRT"), CODE("023", "4xbGhMrE6q"),
+  CODE("026", "BaESVICNoi"), CODE("027", "0FCGVA6vSa"), CODE("009", "0XmEQc2xOf"), CODE("038", "OhvqZtiPKr"), CODE("036", "lupO5WgNdG")]
+const DAILY_CODE = CODE("001", "PqouKr6QWV")
+const FREE_CODES = [DAILY_CODE, CODE("008", "cfWoLwvjU4"), CODE("035", "ArVxJcGDsm"), CODE("006", "DbXS0lrypC"), CODE("039", "KRcQj7wUat"),
+  CODE("040", "mi9rCYg46x"), CODE("007", "nzdH5h4Nl0"), CODE("028", "NtpWi0jzXs"), CODE("037", "WxOD3MpI2o"), CODE("029", "6wCGEWquYy"),
+  CODE("030", "BjSt89qTvr")]
+// a slice package (CapacityType 4) is refreshed each day: its credits are
+// lost at the same midnight on every account, so they tell none apart
+const SLICE = "4"
+
+// beijing is WorkBuddy's own time ("2026-10-13 00:39:27" is UTC+8, as its
+// DeductionEndTime for the same package says).
+const beijing = (ms) => new Date(ms + 8 * 3600_000).toISOString().slice(0, 19).replace("T", " ")
+
+// packagesOf is every package of the account with credits, paid and free,
+// as WorkBuddy's client asks for them: active and used-up (Status 0, 3),
+// up to 10 pages of 200.
+async function packagesOf(site, a, now = Date.now()) {
+  const day = beijing(now).slice(0, 10)
+  const lists = [
+    ["/billing/meter/get-user-resource-paid-packages", { PackageCodes: PAID_CODES, NeedRenewInfo: true }],
+    ["/billing/meter/get-user-resource-free-packages", { PackageCodes: FREE_CODES, SlicePeriodStartTime: day + " 00:00:00", SlicePeriodEndTime: day + " 23:59:59" }],
+  ]
+  const out = []
+  for (const [path, extra] of lists) {
+    for (let page = 1; page <= 10; page++) {
+      const d = await meter(site, a, path, { PageNumber: page, PageSize: 200, Status: [0, 3], ...extra })
+      const got = d?.Accounts ?? []
+      out.push(...got)
+      if (got.length < 200 || out.length >= (d?.TotalCount ?? 0)) break
+    }
+  }
+  return out
+}
+
+// endOf is when a package's credits are lost: its DeductionEndTime, else
+// ExpiredTime, else the cycle's end (UTC+8), as WorkBuddy's client reads it.
+function endOf(p) {
+  const ms = Number(p?.DeductionEndTime)
+  if (ms > 0) return ms
+  for (const v of [p?.ExpiredTime, p?.CycleEndTime]) {
+    if (typeof v !== "string" || !v.trim()) continue
+    const t = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v.trim()) ? Date.parse(v.trim().replace(" ", "T") + "+08:00") : Date.parse(v)
+    if (t > 0) return t
+  }
+  return 0
+}
+
+// runsOutOf is the soonest moment credits left in one of the account's
+// packages are lost, and how many (cdredfox on X): smart routing spends
+// the account whose credits expire first. Only packages the summary
+// counts, with credits left, and not the daily slice; null when none.
+function runsOutOf(sum, packages, now = Date.now()) {
+  const counted = new Set((sum?.Packages ?? []).map((p) => p?.PackageCode))
+  let at = 0, amount = 0
+  for (const p of packages ?? []) {
+    if (!counted.has(p?.PackageCode) || p?.PackageCode === DAILY_CODE || String(p?.CapacityType) === SLICE) continue
+    const left = capacity(p?.CycleCapacityRemainPrecise ?? p?.CycleCapacityRemain)
+    const end = endOf(p)
+    if (!(left > 0) || end <= now) continue
+    if (!at || end < at) at = end, amount = left
+    else if (end === at) amount += left
+  }
+  return at ? { runsOutAt: new Date(at).toISOString(), runsOut: amount } : null
 }
 
 // ---- models -----------------------------------------------------------------
@@ -1012,7 +1211,7 @@ async function liveModels(site, a) {
       if (d) {
         m.context = d.maxInputTokens
         m.output = d.maxOutputTokens
-        m.images = d.supportsImages === true
+        m.images = d.supportsImages === true && !textOnly(site, id)
         const r = creditsOf(d.credits)
         if (r !== undefined) {
           m.free = r === 0
@@ -1108,7 +1307,7 @@ function makePlugin(site) {
             if (body === undefined && req) body = await req.clone().text()
             body = withSystem(body)
             const fit = fitted(body)
-            body = fit.body
+            body = normalizeToolChoice(fit.body)
             attend(headers, body, session)
             const res = await fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body })
             return res.status >= 400 ? explained(res) : kept(await renamed(res, fit.names))
@@ -1124,7 +1323,17 @@ function makePlugin(site) {
         try {
           const a = await current(site, client, auth)
           // the meter has no /v2 prefix, on either site
-          return { ...usageOf(await meter(site, a, "/billing/meter/get-user-resource-summary"), auth.plan), signIn: "kept" }
+          const sum = await meter(site, a, "/billing/meter/get-user-resource-summary")
+          const out = usageOf(sum, auth.plan)
+          // when the credits left run out, for routing to spend them first;
+          // a list that can't be read leaves it unknown, the card stands
+          const credits = out.windows.find((w) => w.name === "Credits")
+          if (credits) {
+            try {
+              Object.assign(credits, runsOutOf(sum, await packagesOf(site, a)) ?? {})
+            } catch {}
+          }
+          return { ...out, signIn: "kept" }
         } catch (e) {
           return { error: e?.message ?? String(e), signIn: "kept" }
         }
@@ -1154,6 +1363,18 @@ const REFUSED_HINT =
   "WorkBuddy refuses chats from Codex and Claude Code (their system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
 const REFUSED = /unapproved channel|illegal api invocation/i
 
+// RESTRICTED_HINT is what the user can do about WorkBuddy's 403 code 11140
+// "request illegal", whose displayMsg says "Your account has been restricted
+// due to unusual activity" (magpie #1849): the account is out until WorkBuddy
+// lifts the restriction, which an appeal asks for. It ends the error's
+// message as magpie's built-in puts it (provider.WBRestrictedHint), word for
+// word, so magpie rests the account for hours rather than minutes.
+const RESTRICTED_HINT =
+  "WorkBuddy restricted this account for unusual activity; it stays out until WorkBuddy lifts that, which an appeal (Submit feedback in WorkBuddy) asks for"
+const RESTRICTED_CODE = 11140
+// The code is matched whole, as with 14018: 111400 is another error.
+const RESTRICTED_TEXT = /account has been restricted due to unusual activity|账号存在异常行为|帳號存在異常行為|["']code["']\s*:\s*["']?11140(?![\d.])/i
+
 // EXHAUSTED_HINT explains WorkBuddy's requirement of an active package
 // even for 0-rate / free models. When an account has no packages or 0 credits,
 // WorkBuddy returns code 14018 ("Credits exhausted...").
@@ -1171,7 +1392,7 @@ function kept(res) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
 }
 
-// explained is res with REFUSED_HINT or EXHAUSTED_HINT added to that refusal's message.
+// explained is res with REFUSED_HINT, RESTRICTED_HINT or EXHAUSTED_HINT added to that refusal's message.
 // Each refusal says the sign-in is kept: the built-in passed WorkBuddy's
 // 401 on and never marked a WorkBuddy account lapsed.
 async function explained(res) {
@@ -1190,8 +1411,9 @@ async function explained(res) {
   const at = v?.error && typeof v.error === "object" ? v.error : v && typeof v === "object" ? v : null
   const code = at?.data?.code ?? at?.code ?? v?.code ?? v?.data?.code
   const isRefused = REFUSED.test(text)
-  const isExhausted = code === 14018 || Number(code) === 14018 || EXHAUSTED_TEXT.test(text)
-  if (!isRefused && !isExhausted) return again(text)
+  const isRestricted = !isRefused && (Number(code) === RESTRICTED_CODE || RESTRICTED_TEXT.test(text))
+  const isExhausted = !isRestricted && (code === 14018 || Number(code) === 14018 || EXHAUSTED_TEXT.test(text))
+  if (!isRefused && !isRestricted && !isExhausted) return again(text)
 
   let msg = text.trim()
   if (at && typeof at.message === "string") msg = at.message
@@ -1200,9 +1422,9 @@ async function explained(res) {
   else if (typeof v?.msg === "string" && v.msg) msg = v.msg // WorkBuddy's own {"code", "msg"}
   else if (typeof v?.data?.msg === "string") msg = v.data.msg
 
-  const hint = isRefused ? REFUSED_HINT : EXHAUSTED_HINT
-  const type = isRefused ? "permission_error" : "insufficient_quota"
-  const errCode = isRefused ? null : 14018
+  const hint = isRefused ? REFUSED_HINT : isRestricted ? RESTRICTED_HINT : EXHAUSTED_HINT
+  const type = isRefused || isRestricted ? "permission_error" : "insufficient_quota"
+  const errCode = isRefused ? null : isRestricted ? RESTRICTED_CODE : 14018
   msg = `${msg} — ${hint}`
   const headers = new Headers(res.headers)
   headers.set("content-type", "application/json")
@@ -1216,4 +1438,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { withSystem, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }
+export const _internal = { notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }

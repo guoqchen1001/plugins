@@ -22,12 +22,11 @@ async function fixture(t, input = {}) {
       res.writeHead(state.modelsStatus, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          data: [
-            { id: "chat-free" },
-            { id: "responses-free" },
-            { id: "messages-free" },
-            { id: "paid" },
-          ],
+          data: (state.ids ?? ["chat-free", "responses-free", "messages-free", "paid"]).map(
+            (id) => ({
+              id,
+            }),
+          ),
         }),
       );
     } else if (req.url === "/catalog") {
@@ -43,6 +42,7 @@ async function fixture(t, input = {}) {
               "responses-free": { provider: { npm: "@ai-sdk/openai" } },
               "messages-free": { provider: { npm: "@ai-sdk/anthropic" } },
               paid: { cost: { input: 3, output: 10 } },
+              "late-free": {},
             },
           },
         }),
@@ -121,12 +121,16 @@ for (const { protocol, path, model } of protocols) {
           assert.equal((tool.parameters ?? tool.input_schema).additionalProperties, false);
           assert.deepEqual((tool.parameters ?? tool.input_schema).properties, {});
         }
+        // A call of a tool the agent doesn't have is left out, said in
+        // the reply's text, and the turn ends as a stop rather than
+        // failing (#76).
         state.reply = toolReply(protocol, "edit", upstreamSSE);
-        const error = await send();
-        if (!stream || !upstreamSSE) assert.equal(error.status, 502);
-        const rejected = await error.text();
-        assert.match(rejected, /error/);
-        assert.doesNotMatch(rejected, /"name"\s*:\s*"edit"/);
+        const left = await send();
+        assert.equal(left.status, 200);
+        const text = await left.text();
+        assert.doesNotMatch(text, /"name"\s*:\s*"edit"/);
+        assert.doesNotMatch(text, /"error"|"tool_calls"|"tool_use"|"function_call"/);
+        assert.match(text, /a tool this agent doesn't have: \\"edit\\"/);
       });
     }
   }
@@ -144,8 +148,10 @@ test("keeps declared tools isolated between requests using the same loader", asy
     });
   assert.equal((await send(declaredTools("chat"))).status, 200);
   const blocked = await send([]);
-  assert.equal(blocked.status, 502);
-  assert.doesNotMatch(await blocked.text(), /"name"\s*:\s*"Bash"/);
+  assert.equal(blocked.status, 200);
+  const text = await blocked.text();
+  assert.doesNotMatch(text, /"name"\s*:\s*"Bash"/);
+  assert.match(text, /a tool this agent doesn't have: \\"bash\\"/);
 });
 
 for (const [input, supplied, expected] of [
@@ -340,8 +346,12 @@ test("rejects paid models, wrong protocol and foreign URLs before sending infere
   await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
   const loader = await plugin.auth.loader(publicAuth);
   const before = state.calls.length;
+  const paid = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "paid", stream: true }),
+  });
+  assert.equal(paid.status, 404);
   for (const [url, model] of [
-    [`${origin}/v1/chat/completions`, "paid"],
     [`${origin}/v1/responses`, "chat-free"],
     ["https://other.example/v1/chat/completions", "chat-free"],
   ]) {
@@ -379,4 +389,80 @@ test("chat headers are scoped to this provider and retain the conversation sessi
     out,
   );
   assert.equal(out.headers["x-session-id"], "s1");
+});
+
+test("a refresh drops a model Zen no longer lists and adds one it lists now", async (t) => {
+  const { plugin, state } = await fixture(t);
+  const before = await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  assert.deepEqual(Object.keys(before).sort(), ["chat-free", "messages-free", "responses-free"]);
+  state.ids = ["chat-free", "messages-free", "late-free"];
+  const after = await plugin.provider.models({ models: before }, { auth: await publicAuth() });
+  assert.deepEqual(Object.keys(after).sort(), ["chat-free", "late-free", "messages-free"]);
+  assert.equal(after[Symbol.for("magpie.fellBack")], undefined);
+  // a failed list keeps the last one, said as fallen back
+  state.modelsStatus = 503;
+  const kept = await plugin.provider.models({ models: after }, { auth: await publicAuth() });
+  assert.deepEqual(Object.keys(kept).sort(), ["chat-free", "late-free", "messages-free"]);
+  assert.equal(kept[Symbol.for("magpie.fellBack")], true);
+});
+
+test("a model no longer free is answered 404 naming the free ones, so only it is set aside", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  const before = state.calls.length;
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "gone-free", stream: true }),
+  });
+  assert.equal(response.status, 404);
+  const body = await response.json();
+  assert.match(body.error.message, /Model gone-free is not available/);
+  assert.match(body.error.message, /chat-free, messages-free, responses-free/);
+  // listed a moment ago: the list isn't asked again for it
+  assert.equal(state.calls.length, before);
+});
+
+test("a model made free since the list was read is served after the list is asked again", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.ids = ["chat-free", "late-free"];
+  state.chatProtocol = "chat/completions";
+  const realNow = Date.now;
+  Date.now = () => realNow() + 61_000;
+  t.after(() => {
+    Date.now = realNow;
+  });
+  const response = await loader.fetch(`${origin}/v1/chat/completions`, {
+    method: "POST",
+    body: JSON.stringify({ model: "late-free", stream: true }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(state.calls.at(-1).body.model, "late-free");
+});
+
+test("a Chat stream Zen closes before its [DONE] ends cut short for a streaming client and fails for one that doesn't (#91)", async (t) => {
+  const { plugin, state, origin } = await fixture(t);
+  await plugin.provider.models({ models: {} }, { auth: await publicAuth() });
+  const loader = await plugin.auth.loader(publicAuth);
+  state.reply =
+    'data: {"id":"x2","object":"chat.completion.chunk","created":1,"model":"chat-free","choices":[{"index":0,"delta":{"role":"assistant"}}],"usage":null}\n\n' +
+    'data: {"id":"x2","object":"chat.completion.chunk","created":1,"model":"chat-free","choices":[{"index":0,"delta":{"content":"Installed successfully and all"}}],"usage":null}\n\n' +
+    'data: {"id":"x2","object":"chat.completion.chunk","created":1,"model":"chat-free","choices":[{"index":0,"delta":{"content":" other plugins are intact."}}],"usage":null}\n\n';
+  const send = (stream) =>
+    loader.fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "chat-free", stream, messages: [{ role: "user", content: "hi" }] }),
+    });
+  const streamed = await send(true);
+  assert.equal(streamed.status, 200);
+  const text = await streamed.text();
+  assert.match(text, /other plugins are intact\./);
+  assert.match(text, /The reply was cut short.*"finish_reason":"stop"/);
+  assert.match(text, /data: \[DONE\]\n\n$/);
+  assert.doesNotMatch(text, /"error"/);
+  const whole = await send(false);
+  assert.notEqual(whole.status, 200);
+  assert.match(await whole.text(), /without a completion marker \(reply x2, 3 events/);
 });

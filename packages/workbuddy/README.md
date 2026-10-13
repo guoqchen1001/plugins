@@ -24,7 +24,8 @@ The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
   - Windows: `~/AppData/Local/CodeBuddyExtension/…`
   - Linux: `~/.local/share/CodeBuddyExtension/…`
 
-  A sign-in the app keeps encrypted can't be read, and this way fails.
+  WorkBuddy 5.6 and later keep the sign-in encrypted, which only the app
+  opens, so this way fails there and says so: use the browser sign-in.
 
 A browser sign-in is kept as an OpenCode `oauth` auth: the access and
 refresh tokens, their expiry, the user id and the domain; desktop's as a
@@ -42,6 +43,14 @@ is never spent twice. A failed renewal, a refresh token past its end
 included, doesn't mark the account, as the built-in never did; magpie
 tries again later, and the old token is used meanwhile.
 OpenCode doesn't call `auth.refresh`; the check before each request stays.
+
+An enterprise (team) account is asked for as the enterprise. A browser
+sign-in keeps the enterprise id WorkBuddy names for the account (from
+`/login/account`, else its account list), and desktop's is read from the
+app's file. Every request then carries `X-Enterprise-Id` and `X-Tenant-Id`,
+as WorkBuddy's own client sends them; without them WorkBuddy answers as the
+personal account, with the personal plan's models. A browser sign-in made
+before 0.1.13 has no enterprise id kept: sign in again.
 
 Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
@@ -73,6 +82,11 @@ Each chat carries WorkBuddy's headers:
 
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
+
+The loader also translates OpenAI-compatible request spellings WorkBuddy
+doesn't take: `max_completion_tokens` becomes `max_tokens`, `developer`
+messages become `system`, and an object `tool_choice` becomes WorkBuddy's
+string form.
 
 A chat's tools are given shapes WorkBuddy's models take. Without them
 WorkBuddy AI answers 400 "Invalid request parameters" (11133), DeepSeek's
@@ -110,6 +124,15 @@ is used.
 - MiniMax-M3
 
 A model's reasoning levels are its variants (`reasoningEffort`).
+
+## Credits in magpie
+
+magpie's usage card shows the account's credits from the resource summary.
+It also says when the soonest credits left run out (`runsOutAt`, and how
+many: `runsOut`), from the paid and free package lists WorkBuddy's own
+client reads. The daily Free Plan slice isn't counted: it ends at the same
+midnight on every account. magpie's smart routing spends the account whose
+credits run out first.
 
 ## Not here
 

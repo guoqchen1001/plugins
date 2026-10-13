@@ -38,6 +38,18 @@ plugin's `fetch` answers them on Cursor's agent API:
 - Each request is one `agent.v1.AgentService/Run`, a Connect stream both
   ways over HTTP/2, with the CLI's headers (`x-cursor-client-type: cli`,
   its version, privacy mode on).
+- Where HTTP/2 can't open a Run (an error before its response, or none in
+  15 s: a proxy or network that blocks HTTP/2), it goes as Cursor's clients
+  run it without HTTP/2: `agent.v1.AgentService/RunSSE` down and a
+  `aiserver.v1.BidiService/BidiAppend` for each client message up, over
+  HTTP/1.1 on `api2.cursor.sh`, through the proxy magpie gives the request.
+  When the failure says HTTP/2 itself can't be had (no head in 15 s,
+  "h2 is not supported", no HTTP/2 in ALPN, a protocol error), the Runs
+  after it go straight to HTTP/1.1 for 10 minutes; a failed connection
+  (refused, no network) or a stream the server refused leaves the next Run
+  to try HTTP/2 again. A region error over HTTP/1.1 sends the Run back to
+  HTTP/2 at the region's agent host. A BidiAppend with no answer in 60 s
+  (more for a large one) ends the Run, as cursor-agent does.
 - The whole conversation goes each time, as AI SDK messages kept as blobs
   the server asks for. The caller's tools are MCP tools, listed in the
   system prompt; the model calls them through Cursor's `CallDynamicTool`,
@@ -51,7 +63,11 @@ plugin's `fetch` answers them on Cursor's agent API:
   so subagents under one session are conversations of their own. With
   nothing naming the session, each Run has a new one.
 - Text, thinking (`reasoning_content`) and token usage come back streamed
-  or not. Cursor's `input_tokens` counts the cached prompt too: the cache
+  or not. Replayed assistant `reasoning_content` (or `reasoning`) is kept as
+  AI SDK reasoning parts in the next Run's transcript, including when a
+  caller splits parallel tool calls across assistant messages. It stays
+  separate from reply text; no thinking signature is invented.
+  Cursor's `input_tokens` counts the cached prompt too: the cache
   read and written is taken out of it, and given as `cached_tokens` and
   `cache_write_tokens`, so it is counted once; its reasoning tokens are
   `reasoning_tokens`. A step that calls tools gets no usage in its Run
@@ -112,9 +128,29 @@ minutes), the way pi-cursor-sdk lists Cursor's catalog:
   and `service_tier` counting as for a listed model. The list doesn't show
   these ids: pick the `@<size>` model for a window that is the model's.
 
+## Usage
+
+magpie shows Cursor Models, Other Models and Total for the billing period.
+Accounts with a Grok Bot allowance also show its usage and reset time;
+active trials are labelled separately. A spent Bot allowance doesn't stop
+Cursor requests.
+
+An account that may spend on-demand once its included usage is gone (a
+team or personal spend limit, as `cursor-agent`'s usage view shows it) also
+shows On-demand: its spend, and its limit when it has one. Cursor keeps
+serving such an account past the included usage, so magpie doesn't count
+it used up when Cursor Models or Other Models reach 100%; it does when the
+on-demand spend reaches its limit. A team member with no limit of their
+own spends the team's pool: On-demand shows the pool's spend and limit,
+with the member's own spend beside it, and the account is used up when
+the pool is.
+
+Sign in to the Cursor account linked in Grok Bot. A linked SuperGrok
+subscription grants Bot access without a paid Cursor plan; see
+[Grok Bot plans and billing](https://cursor.com/help/grok-bot/plans).
+
 ## Not included
 
-- Usage and plan limits.
 - Web search: Cursor's own web search is refused like its other tools.
 - Switching between several accounts. OpenCode keeps one sign-in per
   provider.
